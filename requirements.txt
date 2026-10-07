@@ -1,0 +1,3 @@
+# SDK — из Package Registry connector-sdk (адрес реестра задаётся при установке,
+# см. README и Dockerfile); остальное — из PyPI.
+infopanel-connect>=2.2,<3
