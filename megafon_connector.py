@@ -1,22 +1,23 @@
 """Коннектор Инфопанели для телефонии Мегафон (виртуальная АТС).
 
-Звонки выгружаются методом CRM API ``GET /crmapi/v1/history/json``
-(документация: https://api.megapbx.ru/#/docs/crmapi/v1). Авторизация —
-заголовок ``X-API-KEY`` с ключом из поля «Ключ для авторизации в АТС» личного
-кабинета Мегафона; адрес вида ``https://{домен}/crmapi/v1/…``, домен вводит
-пользователь при подключении источника.
+Данные берутся из CRM API (документация: https://api.megapbx.ru/#/docs/crmapi/v1):
 
-Сотрудники (``operators``) пока не выгружаются: нужен метод
-``GET /crmapi/v1/users`` и его схема ответа — см. заглушку в ``fetch``.
+- звонки — ``GET /crmapi/v1/history/json``;
+- сотрудники — ``GET /crmapi/v1/users?with=status``;
+- отделы и их состав — ``GET /crmapi/v1/groups``.
+
+Авторизация — заголовок ``X-API-KEY`` с ключом из поля «Ключ для авторизации
+в АТС» личного кабинета Мегафона; адрес вида ``https://{домен}/crmapi/v1/…``,
+домен вводит пользователь при подключении источника.
 
 Запуск из корня репозитория (PowerShell):
 
     $env:INFOPANEL_SIGNING_SECRET = "dev"
     infopanel-connect serve megafon_connector:MegafonConnector
 
-Проверка без платформы:
+Проверка без платформы (secrets.json — {"api_key": "<ключ>"}):
 
-    infopanel-connect check megafon_connector:MegafonConnector
+    infopanel-connect check megafon_connector:MegafonConnector --secrets secrets.json
 
 Протокол и шаблоны — docs/protocol.md и docs/templates.md в репозитории
 connector-sdk (https://gitlab.itgrn.ru/infopanel/connector-sdk).
@@ -45,6 +46,8 @@ from infopanel_connect import egress
 
 CALLS = Entity("calls", "Звонки")
 OPERATORS = Entity("operators", "Сотрудники")
+GROUPS = Entity("groups", "Отделы")
+GROUP_MEMBERS = Entity("group_members", "Состав отделов")
 
 # --------------------------------------------------------------------------- #
 # CRM API Мегафона (https://api.megapbx.ru/#/docs/crmapi/v1): адрес вида
@@ -52,9 +55,11 @@ OPERATORS = Entity("operators", "Сотрудники")
 # --------------------------------------------------------------------------- #
 
 HISTORY_PATH = "/crmapi/v1/history/json"
-USERS_PATH = "/crmapi/v1/users"  # для сущности «operators» — ждём схему ответа
+USERS_PATH = "/crmapi/v1/users"
+GROUPS_PATH = "/crmapi/v1/groups"
 DATE_COLUMN = "date"  # колонка, по которой приходит период датасета
 DEFAULT_DOMAIN = "api.megapbx.ru"  # домен CRM API, если у клиента АТС не на своём домене
+MAX_PAGES = 1000  # предохранитель от бесконечного обхода страниц
 
 # missedStatus из ответа: 1 — клиент перезвонил, 2 — перезвонили,
 # 3 — не перезванивали, 4 — не дозвонились.
@@ -67,13 +72,14 @@ MISSED_STATUS: dict[int, str] = {
 
 # --------------------------------------------------------------------------- #
 # Колонки сущностей: имена — для платформы, подписи — для людей.
-# Ключи строк из fetch обязаны совпадать с этими именами; состав — по полям
-# ответа /crmapi/v1/history/json (uid, start, type, status, client, diversion,
-# telnum_name, destination, user, user_name, group_name, wait, duration,
-# record, rating, note, missedStatus).
+# Ключи строк из fetch обязаны совпадать с этими именами. Логического типа у
+# колонок нет — флаги отдаём числами 1/0 (сумма по колонке — количество «да»).
 # --------------------------------------------------------------------------- #
 
 COLUMNS: dict[str, list[Column]] = {
+    # По полям ответа /crmapi/v1/history/json (uid, start, type, status, client,
+    # diversion, telnum_name, destination, user, user_name, group_name, wait,
+    # duration, record, rating, note, missedStatus).
     "calls": [
         Column("id", "ID звонка", "string"),
         Column("date", "Дата и время начала", "datetime"),
@@ -93,11 +99,45 @@ COLUMNS: dict[str, list[Column]] = {
         Column("note", "Примечание", "string"),
         Column("missed_status", "Статус пропущенного звонка", "string"),
     ],
-    # TODO: выровнять по ответу GET /crmapi/v1/users, когда будет схема.
+    # По ответу /crmapi/v1/users?with=status; login совпадает с
+    # calls.operator_login и group_members.login.
     "operators": [
-        Column("id", "ID сотрудника", "string"),
+        Column("login", "Логин", "string"),
         Column("name", "Имя", "string"),
-        Column("extension", "Внутренний номер", "string"),
+        Column("position", "Должность", "string"),
+        Column("email", "Электронная почта", "string"),
+        Column("ext", "Внутренний номер", "string"),
+        Column("telnum", "Прямой номер", "string"),
+        Column("mobile", "Мобильный телефон", "string"),
+        Column("role", "Права в системе", "string"),
+        Column("status", "Статус регистрации (на момент выгрузки)", "string"),
+        Column("mobile_redirect", "Переадресация на мобильный", "number"),
+        Column("mobile_redirect_forward", "Переадресация на мобильный: forward", "number"),
+        Column("mobile_redirect_delay", "Задержка переадресации на мобильный, сек", "number"),
+    ],
+    # По ответу /crmapi/v1/groups; объект timeout развёрнут в две колонки.
+    "groups": [
+        Column("id", "ID отдела", "string"),
+        Column("name", "Отдел", "string"),
+        Column("ext", "Внутренний номер", "string"),
+        Column("call_order", "Распределение звонков", "string"),
+        Column("call_duration", "Интервал дозвона, сек", "number"),
+        Column("timeout_time", "Если никто не отвечает: через, сек", "number"),
+        Column("timeout_target", "Если никто не отвечает: куда", "string"),
+        Column("advanced", "Для нетерпеливых клиентов", "string"),
+        Column("queue_position", "Сообщать номер в очереди", "number"),
+        Column("users_count", "Сотрудников в отделе", "number"),
+    ],
+    # Строка на пару «отдел — сотрудник» из groups[].users[]: сотрудник может
+    # состоять в нескольких отделах.
+    "group_members": [
+        Column("group_id", "ID отдела", "string"),
+        Column("group_name", "Отдел", "string"),
+        Column("login", "Логин сотрудника", "string"),
+        Column("calls_enable", "Принимает звонки отдела", "number"),
+        Column("group_head", "Руководитель отдела", "number"),
+        Column("is_absence_active", "Отсутствует", "number"),
+        Column("is_forwarding_disabled", "Переадресация отключена", "number"),
     ],
 }
 
@@ -151,7 +191,7 @@ def _period(conditions: tuple[Condition, ...]):
 
 
 def _call_row(item: dict) -> dict:
-    """Ответ Мегафона → строка с ключами из COLUMNS["calls"]."""
+    """Звонок из /history/json → строка с ключами из COLUMNS["calls"]."""
     missed = item.get("missedStatus")
     try:
         missed_status = MISSED_STATUS.get(int(missed)) if missed is not None else None
@@ -178,8 +218,80 @@ def _call_row(item: dict) -> dict:
     }
 
 
+def _operator_row(item: dict) -> dict:
+    """Сотрудник из /users → строка с ключами из COLUMNS["operators"].
+
+    mobile_redirect приходит как {"enabled": true, "forward": false, "delay": 15};
+    при выключенной переадресации — только {"enabled": false}.
+    """
+    redirect = item.get("mobile_redirect")
+    redirect = redirect if isinstance(redirect, dict) else {}
+    enabled = redirect.get("enabled")
+    return {
+        "login": _text(item.get("login")),
+        "name": _text(item.get("name")),
+        "position": _text(item.get("position")),
+        "email": _text(item.get("email")),
+        "ext": _text(item.get("ext")),
+        "telnum": _text(item.get("telnum")),
+        "mobile": _text(item.get("mobile")),
+        "role": _text(item.get("role")),
+        "status": _text(item.get("status")),
+        "mobile_redirect": _flag(enabled),
+        "mobile_redirect_forward": _flag(redirect.get("forward")) if enabled else None,
+        "mobile_redirect_delay": _number(redirect.get("delay")) if enabled else None,
+    }
+
+
+def _group_row(item: dict) -> dict:
+    """Отдел из /groups → строка с ключами из COLUMNS["groups"]."""
+    timeout = item.get("timeout")
+    timeout = timeout if isinstance(timeout, dict) else {}
+    users = item.get("users")
+    return {
+        "id": _text(item.get("id")),
+        "name": _text(item.get("name")),
+        "ext": _text(item.get("ext")),
+        "call_order": _text(item.get("call_order")),
+        "call_duration": _number(item.get("call_duration")),
+        "timeout_time": _number(timeout.get("time")),
+        "timeout_target": _text(timeout.get("target")),
+        "advanced": _text(item.get("advanced")),
+        "queue_position": _flag(item.get("queue_position")),
+        "users_count": len(users) if isinstance(users, list) else 0,
+    }
+
+
+def _member_rows(item: dict) -> list[dict]:
+    """Отдел из /groups → строки «отдел — сотрудник» (COLUMNS["group_members"])."""
+    users = item.get("users")
+    if not isinstance(users, list):
+        return []
+    group_id, group_name = _text(item.get("id")), _text(item.get("name"))
+    rows = []
+    for user in users:
+        if isinstance(user, str):  # на случай ответа списком логинов
+            user = {"login": user}
+        if not isinstance(user, dict):
+            continue
+        rows.append({
+            "group_id": group_id,
+            "group_name": group_name,
+            "login": _text(user.get("login")),
+            "calls_enable": _flag(user.get("calls_enable")),
+            "group_head": _flag(user.get("group_head")),
+            "is_absence_active": _flag(user.get("is_absence_active")),
+            "is_forwarding_disabled": _flag(user.get("is_forwarding_disabled")),
+        })
+    return rows
+
+
 def _text(value):
-    return None if value is None else (value if isinstance(value, str) else str(value))
+    """Строка или None; пустые строки Мегафона («"user": ""») — тоже None."""
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    return text if text.strip() else None
 
 
 def _number(value):
@@ -194,15 +306,24 @@ def _number(value):
         return None
 
 
+def _flag(value):
+    """true/false из ответа → 1/0 (у колонок нет логического типа)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip().lower() in ("1", "true", "yes", "on")
+    return 1 if value else 0
+
+
 class MegafonConnector(Connector):
-    """Телефония Мегафон: звонки выгружаются из CRM API; сотрудники — в работе."""
+    """Телефония Мегафон: звонки, сотрудники и отделы из CRM API."""
 
     # --- Карточка в маркетплейсе (операция manifest) ----------------------- #
 
     name = "megafon-telephony"  # латиница/цифры/«-»/«_»; между версиями не менять
     label = "Телефония Мегафон"
-    description = "Звонки и сотрудники виртуальной АТС Мегафон."
-    version = "0.2.0"
+    description = "Звонки, сотрудники и отделы виртуальной АТС Мегафон."
+    version = "0.3.0"
     publisher = "ITGRN"
     docs_url = ""  # ссылка на документацию, если появится
 
@@ -240,51 +361,36 @@ class MegafonConnector(Connector):
     # --- Наборы данных известны заранее (операция entities) ---------------- #
     # entities() не переопределяем: базовый отдаст entity_catalog как есть.
 
-    entity_catalog = (CALLS, OPERATORS)
+    entity_catalog = (CALLS, OPERATORS, GROUPS, GROUP_MEMBERS)
 
     # --- Данные (операция fetch) ------------------------------------------- #
 
     async def fetch(
         self, ctx: Context, entity: str, conditions: tuple[Condition, ...]
     ) -> FetchResult:
-        """Строки сущности: звонки — из CRM API, сотрудники — заглушка.
+        """Строки сущности из CRM API.
 
-        Метод отдаёт всю историю за период одним ответом (пагинации в
-        /crmapi/v1/history/json нет — есть только limit), поэтому fetch_page
-        не переопределяем: SDK сам нарежет строки на страницы.
+        Все методы отдают данные целиком (история за период — одним ответом,
+        справочники обходим по страницам сами), поэтому fetch_page не
+        переопределяем: SDK сам нарежет строки на страницы.
         """
         self.entity(entity)
+
         if entity == OPERATORS.id:
-            raise NotImplementedError(
-                "Сотрудники: реализуйте GET /crmapi/v1/users, когда будет "
-                "известна схема ответа (см. TODO у COLUMNS[\"operators\"])"
-            )
+            items = await self._list(ctx, USERS_PATH, {"with": "status"})
+            return FetchResult([_operator_row(i) for i in items])
+        if entity == GROUPS.id:
+            items = await self._list(ctx, GROUPS_PATH)
+            return FetchResult([_group_row(i) for i in items])
+        if entity == GROUP_MEMBERS.id:
+            items = await self._list(ctx, GROUPS_PATH)
+            return FetchResult([row for i in items for row in _member_rows(i)])
 
-        api_key = ctx.require("api_key")
-        domain = _domain(ctx.value("api_domain") or DEFAULT_DOMAIN)
         start, end, applied = _period(conditions)
-
-        # egress.fetch проверяет адрес (домен вводит пользователь — защита от
-        # походов во внутреннюю сеть), ходит через корпоративный прокси, если
-        # он задан, и сам оборачивает таймауты и обрывы связи в UpstreamError.
-        response = await egress.fetch(
-            "GET",
-            f"https://{domain}{HISTORY_PATH}",
-            params={name: value for name, value in (("start", start), ("end", end)) if value},
-            headers={"X-API-KEY": api_key},
-            timeout=60.0,
-        )
-        if response.status_code in (401, 403):
-            raise ConfigError("Мегафон отверг ключ — проверьте «Ключ для авторизации в АТС»")
-        if response.status_code >= 400:
-            raise UpstreamError(f"АТС Мегафона ответила ошибкой (HTTP {response.status_code})")
-        try:
-            data = response.json()
-        except ValueError:
-            raise UpstreamError("АТС Мегафона ответила не в формате JSON") from None
+        params = {name: value for name, value in (("start", start), ("end", end)) if value}
+        data = await self._get(ctx, HISTORY_PATH, params)
         if not isinstance(data, list):
             raise UpstreamError("АТС Мегафона ответила в неожиданном формате")
-
         rows = [_call_row(item) for item in data if isinstance(item, dict)]
         return FetchResult(rows, applied=applied)
 
@@ -296,8 +402,11 @@ class MegafonConnector(Connector):
         return {i: COLUMNS[i] for i in entity_ids if i in COLUMNS}
 
     # --- Кнопка «Проверить» (операция test) -------------------------------- #
-    # Не переопределяем: базовый test проверит сущности и первую выгрузку.
-    # Когда появится дешёвый endpoint (профиль/баланс) — замените на него.
+
+    async def test(self, ctx: Context) -> str:
+        """Лёгкая проверка ключа — список сотрудников вместо истории звонков."""
+        items = await self._list(ctx, USERS_PATH)
+        return f"Подключение к АТС Мегафона работает; сотрудников: {len(items)}"
 
     # --- Утилиты ------------------------------------------------------------ #
 
@@ -307,3 +416,52 @@ class MegafonConnector(Connector):
             if item.id == entity_id:
                 return item
         raise ConfigError(f"Нет сущности «{entity_id}»")
+
+    async def _get(self, ctx: Context, path: str, params: dict | None = None):
+        """GET к CRM API → разобранный JSON; ошибки — понятными исключениями SDK."""
+        api_key = ctx.require("api_key")
+        domain = _domain(ctx.value("api_domain") or DEFAULT_DOMAIN)
+        # egress.fetch проверяет адрес (домен вводит пользователь — защита от
+        # походов во внутреннюю сеть), ходит через корпоративный прокси, если
+        # он задан, и сам оборачивает таймауты и обрывы связи в UpstreamError.
+        response = await egress.fetch(
+            "GET",
+            f"https://{domain}{path}",
+            params=params or {},
+            headers={"X-API-KEY": api_key},
+            timeout=60.0,
+        )
+        if response.status_code in (401, 403):
+            raise ConfigError("Мегафон отверг ключ — проверьте «Ключ для авторизации в АТС»")
+        if response.status_code >= 400:
+            raise UpstreamError(f"АТС Мегафона ответила ошибкой (HTTP {response.status_code})")
+        try:
+            return response.json()
+        except ValueError:
+            raise UpstreamError("АТС Мегафона ответила не в формате JSON") from None
+
+    async def _list(self, ctx: Context, path: str, params: dict | None = None) -> list[dict]:
+        """Справочник целиком.
+
+        Ответ — {"items": [...], "info": {"start", "limit", "total"}}: пока не
+        набрали total, просим следующую страницу с start. Голый список тоже
+        принимаем.
+        """
+        items: list[dict] = []
+        query = dict(params or {})
+        for _ in range(MAX_PAGES):
+            data = await self._get(ctx, path, query)
+            if isinstance(data, list):
+                return [i for i in data if isinstance(i, dict)]
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                raise UpstreamError("АТС Мегафона ответила в неожиданном формате")
+            page = [i for i in data["items"] if isinstance(i, dict)]
+            items.extend(page)
+            info = data.get("info") if isinstance(data.get("info"), dict) else {}
+            total = _number(info.get("total"))
+            if not page or total is None or len(items) >= total:
+                return items
+            query["start"] = len(items)
+            if _number(info.get("limit")):
+                query["limit"] = info["limit"]
+        raise UpstreamError("АТС Мегафона отдаёт слишком много страниц")
