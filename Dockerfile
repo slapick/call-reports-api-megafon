@@ -5,7 +5,7 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # SDK infopanel-connect — из Package Registry проекта connector-sdk.
-ARG PIP_INDEX_URL=https://gitlab.itgrn.ru/api/v4/projects/94/packages/pypi/simple
+ARG PIP_INDEX_URL=https://gitlab.itgrn.ru/api/v4/projects/infopanel%2Fconnector-sdk/packages/pypi/simple
 ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple
 
 COPY requirements.txt /app/requirements.txt

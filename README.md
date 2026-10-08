@@ -26,7 +26,7 @@ Dockerfile             образ сервиса
 
 ```bash
 pip install -r requirements.txt \
-  --index-url https://gitlab.itgrn.ru/api/v4/projects/94/packages/pypi/simple \
+  --index-url https://gitlab.itgrn.ru/api/v4/projects/infopanel%2Fconnector-sdk/packages/pypi/simple \
   --extra-index-url https://pypi.org/simple
 infopanel-connect check megafon_connector:MegafonConnector --secrets secrets.json  # {"api_key": "<ключ>"}
 INFOPANEL_SIGNING_SECRET=dev infopanel-connect serve megafon_connector:MegafonConnector --port 8090
