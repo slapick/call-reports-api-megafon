@@ -1,21 +1,23 @@
 # Коннектор Инфопанели: телефония Мегафон
 
-Выгружает данные виртуальной АТС Мегафон через CRM API
-(https://api.megapbx.ru/#/docs/crmapi/v1).
+Выгружает данные виртуальной АТС Мегафон:
+- **Мегафон ВАТС 2.0** (`simple-api.cp.megafon.ru` и `data-api.cp.megafon.ru`, авторизация JWT-токеном);
+- **Мегафон ВАТС 1.0 legacy** (`api.megapbx.ru`, CRM API v1).
+
 Построен на SDK [infopanel-connect](https://gitlab.itgrn.ru/infopanel/connector-sdk).
 
-| Сущность | Метод API | Связь |
-|---|---|---|
-| `calls` — звонки | `GET /crmapi/v1/history/json` | `operator_login` → `operators.login` |
-| `operators` — сотрудники | `GET /crmapi/v1/users?with=status` | `login` |
-| `groups` — отделы | `GET /crmapi/v1/groups` | `id` |
-| `group_members` — состав отделов | `GET /crmapi/v1/groups` (`users[]`) | `group_id` → `groups.id`, `login` → `operators.login` |
+| Сущность | Метод API (ВАТС 2.0) | Метод API (ВАТС 1.0) | Связь |
+|---|---|---|---|
+| `calls` — звонки | JSON-RPC 2.0 `get.mgf_calls` | `GET /crmapi/v1/history/json` | `operator_login` → `operators.login` |
+| `operators` — сотрудники | `GET /employee` | `GET /crmapi/v1/users?with=status` | `login` |
+| `groups` — отделы | `GET /employee-group` | `GET /crmapi/v1/groups` | `id` |
+| `group_members` — состав отделов | `GET /employee-group` + `/employee` | `GET /crmapi/v1/groups` (`users[]`) | `group_id` → `groups.id`, `login` → `operators.login` |
 
 Логические признаки отдаются числами 1/0 (логического типа у колонок SDK нет).
 
 ```
 megafon_connector.py   коннектор (класс MegafonConnector)
-tests/                 тесты (CRM API подменяется примерами ответов)
+tests/                 тесты (API подменяется примерами ответов)
 requirements.txt       зависимости: infopanel-connect>=2.2,<3
 requirements-dev.txt   + pytest
 Dockerfile             образ сервиса
@@ -114,5 +116,5 @@ curl http://localhost:8090/health
 
 ## Подключение источника
 
-- **Домен АТС Мегафона** — по умолчанию `api.megapbx.ru`;
-- **Ключ для авторизации в АТС** — из личного кабинета Мегафона (настройки интеграции).
+- **Домен АТС Мегафона** — по умолчанию `simple-api.cp.megafon.ru` (для ВАТС 2.0); для ВАТС 1.0 укажите `api.megapbx.ru`;
+- **Ключ для авторизации в АТС** — из личного кабинета Мегафона (Интеграция с CRM → API → «Сгенерировать ключ»).
