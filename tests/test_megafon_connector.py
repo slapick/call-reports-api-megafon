@@ -262,9 +262,9 @@ async def test_operators_v2(api):
     rows = (await MegafonConnector().fetch(ctx_v2(), "operators", ())).rows
     admin, director, user1 = rows
     assert admin["email"] is None and admin["status"] == "online"
-    assert (admin["mobile_redirect"], admin["mobile_redirect_forward"], admin["mobile_redirect_delay"]) == (0, None, None)
+    assert (admin["mobile_redirect"], admin["mobile_redirect_forward"], admin["mobile_redirect_delay"]) == (False, None, None)
     assert user1["mobile"] == "79261904198" and user1["status"] == "offline"
-    assert (user1["mobile_redirect"], user1["mobile_redirect_delay"]) == (1, 15)
+    assert (user1["mobile_redirect"], user1["mobile_redirect_delay"]) == (True, 15)
 
 
 async def test_groups_and_members_v2(api):
@@ -280,8 +280,38 @@ async def test_groups_and_members_v2(api):
         ("sales", "director"),
         ("sales", "user1"),
     ]
-    assert members[0]["calls_enable"] == 1
-    assert members[1]["calls_enable"] == 0
+    assert members[0]["calls_enable"] is True
+    assert members[1]["calls_enable"] is False
+
+
+async def test_report_columns(api):
+    result = await MegafonConnector().fetch(ctx_v2(), "calls", ())
+    missed, success = result.rows
+
+    assert missed["client_phone"] == "79263808397"
+    assert missed["is_inbound"] is True
+    assert missed["is_answered"] is False
+    assert missed["is_missed"] is True
+    assert missed["answered_percent"] == 0
+    assert missed["missed_percent"] == 100
+    assert missed["direction_name"] == "Входящие"
+    assert missed["status_name"] == "Пропущен"
+    assert missed["has_recording"] is False
+    assert missed["is_internal"] is False
+    assert missed["hour"] == "08:00"
+    assert missed["weekday"] == "4 Чт"
+
+    assert success["client_phone"] == "79263808397"
+    assert success["is_inbound"] is True
+    assert success["is_answered"] is True
+    assert success["is_missed"] is False
+    assert success["answered_percent"] == 100
+    assert success["missed_percent"] == 0
+    assert success["minutes"] == 0.38  # 23 сек / 60
+    assert success["direction_name"] == "Входящие"
+    assert success["status_name"] == "Принят"
+    assert success["hour"] == "08:00"
+    assert success["weekday"] == "4 Чт"
 
 
 async def test_bad_key(monkeypatch):

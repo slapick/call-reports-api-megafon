@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+import megafon_templates as t
 from infopanel_connect import (
     Column,
     Condition,
@@ -110,7 +111,9 @@ COLUMNS: dict[str, list[Column]] = {
         Column("id", "ID звонка", "string"),
         Column("date", "Дата и время начала", "datetime"),
         Column("direction", "Направление (in/out)", "string"),
+        Column("direction_name", "Направление", "string"),
         Column("status", "Статус (success/missed/noanswer)", "string"),
+        Column("status_name", "Статус", "string"),
         Column("client_number", "Номер клиента", "string"),
         Column("diversion", "Номер ВАТС, по которому пришёл звонок", "string"),
         Column("telnum_name", "Имя номера ВАТС", "string"),
@@ -124,6 +127,18 @@ COLUMNS: dict[str, list[Column]] = {
         Column("rating", "Оценка качества обслуживания", "number"),
         Column("note", "Примечание", "string"),
         Column("missed_status", "Статус пропущенного звонка", "string"),
+        # Вычисляемые для отчётов (см. _call_row): шаги датасета не умеют «если».
+        Column("client_phone", "Номер клиента", "string"),
+        Column("is_inbound", "Входящий", "boolean"),
+        Column("is_answered", "Разговор состоялся", "boolean"),
+        Column("is_missed", "Пропущенный входящий", "boolean"),
+        Column("answered_percent", "Разговор состоялся, % (100/0)", "number"),
+        Column("missed_percent", "Пропущенный входящий, % (100/0)", "number"),
+        Column("minutes", "Длительность разговора, мин", "number"),
+        Column("hour", "Час начала (по времени АТС)", "string"),
+        Column("weekday", "День недели (по времени АТС)", "string"),
+        Column("has_recording", "Есть запись разговора", "boolean"),
+        Column("is_internal", "Внутренний звонок", "boolean"),
     ],
     "operators": [
         Column("login", "Логин", "string"),
@@ -135,8 +150,8 @@ COLUMNS: dict[str, list[Column]] = {
         Column("mobile", "Мобильный телефон", "string"),
         Column("role", "Права в системе", "string"),
         Column("status", "Статус регистрации (на момент выгрузки)", "string"),
-        Column("mobile_redirect", "Переадресация на мобильный", "number"),
-        Column("mobile_redirect_forward", "Переадресация на мобильный: forward", "number"),
+        Column("mobile_redirect", "Переадресация на мобильный", "boolean"),
+        Column("mobile_redirect_forward", "Переадресация на мобильный: forward", "boolean"),
         Column("mobile_redirect_delay", "Задержка переадресации на мобильный, сек", "number"),
     ],
     "groups": [
@@ -148,17 +163,17 @@ COLUMNS: dict[str, list[Column]] = {
         Column("timeout_time", "Если никто не отвечает: через, сек", "number"),
         Column("timeout_target", "Если никто не отвечает: куда", "string"),
         Column("advanced", "Для нетерпеливых клиентов", "string"),
-        Column("queue_position", "Сообщать номер в очереди", "number"),
+        Column("queue_position", "Сообщать номер в очереди", "boolean"),
         Column("users_count", "Сотрудников в отделе", "number"),
     ],
     "group_members": [
         Column("group_id", "ID отдела", "string"),
         Column("group_name", "Отдел", "string"),
         Column("login", "Логин сотрудника", "string"),
-        Column("calls_enable", "Принимает звонки отдела", "number"),
-        Column("group_head", "Руководитель отдела", "number"),
-        Column("is_absence_active", "Отсутствует", "number"),
-        Column("is_forwarding_disabled", "Переадресация отключена", "number"),
+        Column("calls_enable", "Принимает звонки отдела", "boolean"),
+        Column("group_head", "Руководитель отдела", "boolean"),
+        Column("is_absence_active", "Отсутствует", "boolean"),
+        Column("is_forwarding_disabled", "Переадресация отключена", "boolean"),
     ],
 }
 
@@ -287,6 +302,28 @@ def _period_v2(conditions: tuple[Condition, ...]):
     return date_from, date_till, tuple(applied)
 
 
+WEEKDAYS = ("1 Пн", "2 Вт", "3 Ср", "4 Чт", "5 Пт", "6 Сб", "7 Вс")
+DIRECTIONS = {
+    "in": "Входящие",
+    "out": "Исходящие",
+    "internal": "Внутренние",
+}
+
+
+def _call_moment(val) -> datetime | None:
+    if not val:
+        return None
+    text = str(val).strip().replace(" ", "T")
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo == timezone.utc:
+            # Мегафон ВАТС 1.0 отдаёт UTC (Z) — переводим в московское время (+03:00)
+            dt = dt.astimezone(timezone(timedelta(hours=3)))
+        return dt
+    except ValueError:
+        return None
+
+
 def _call_row(item: dict, name_to_login: dict | None = None) -> dict:
     """Звонок → строка с ключами из COLUMNS["calls"]."""
     uid = item.get("communication_id") if item.get("communication_id") is not None else item.get("uid")
@@ -300,6 +337,8 @@ def _call_row(item: dict, name_to_login: dict | None = None) -> dict:
         direction = call_dir.get("value_id") or call_dir.get("value")
     else:
         direction = call_dir or item.get("type")
+    direction = _text(direction)
+    direction_name = DIRECTIONS.get(direction or "", direction)
 
     call_stat = item.get("call_status")
     if isinstance(call_stat, dict):
@@ -316,11 +355,40 @@ def _call_row(item: dict, name_to_login: dict | None = None) -> dict:
     else:
         status = None
 
+    if direction == "out":
+        status_name = "Дозвонился" if status == "success" else "Не дозвонился"
+    elif status == "success":
+        status_name = "Принят"
+    elif status:
+        status_name = "Пропущен"
+    else:
+        status_name = None
+
     client = item.get("contact_phone_number")
     if isinstance(client, dict):
         client = client.get("value")
     else:
         client = client or item.get("client")
+
+    is_int_raw = item.get("call_is_internal")
+    if isinstance(is_int_raw, dict):
+        val = str(is_int_raw.get("value_id") or is_int_raw.get("value") or "").lower()
+        is_internal = (val == "internal") if val in ("internal", "external") else _flag(val)
+    elif isinstance(is_int_raw, str):
+        val = is_int_raw.lower()
+        is_internal = (val == "internal") if val in ("internal", "external") else _flag(val)
+    elif is_int_raw is not None:
+        is_internal = bool(is_int_raw)
+    else:
+        call_type = item.get("call_type")
+        if isinstance(call_type, dict):
+            ct_val = str(call_type.get("value_id") or "").lower()
+        else:
+            ct_val = str(call_type or item.get("type") or "").lower()
+        is_internal = (ct_val == "internal") or bool(item.get("is_internal"))
+
+    client_number = _text(client)
+    client_phone = None if is_internal else client_number
 
     employees = item.get("employees")
     op_name = None
@@ -380,12 +448,19 @@ def _call_row(item: dict, name_to_login: dict | None = None) -> dict:
         except (TypeError, ValueError):
             missed_status = None
 
+    is_inbound = (direction == "in") if direction else None
+    answered = (status == "success") if status else None
+    missed = (is_inbound and status != "success") if (is_inbound is not None and status) else False
+    moment = _call_moment(start)
+
     return {
         "id": _text(uid),
         "date": _text(start),
-        "direction": _text(direction),
+        "direction": direction,
+        "direction_name": direction_name,
         "status": status,
-        "client_number": _text(client),
+        "status_name": status_name,
+        "client_number": client_number,
         "diversion": _text(item.get("virtual_phone_number") or item.get("diversion")),
         "telnum_name": _text(item.get("virtual_number_comment") or item.get("telnum_name")),
         "destination": _text(item.get("destination")),
@@ -398,6 +473,17 @@ def _call_row(item: dict, name_to_login: dict | None = None) -> dict:
         "rating": _number(item.get("employee_rating") or item.get("rating")),
         "note": note,
         "missed_status": missed_status,
+        "client_phone": client_phone,
+        "is_inbound": is_inbound,
+        "is_answered": answered,
+        "is_missed": missed,
+        "answered_percent": (100 if answered else 0) if answered is not None else None,
+        "missed_percent": (100 if missed else 0) if missed is not None else None,
+        "minutes": round(dur / 60, 2) if dur is not None else None,
+        "hour": f"{moment.hour:02d}:00" if moment else None,
+        "weekday": WEEKDAYS[moment.weekday()] if moment else None,
+        "has_recording": bool(rec_url),
+        "is_internal": is_internal,
     }
 
 
@@ -542,13 +628,13 @@ def _number(value):
         return None
 
 
-def _flag(value):
-    """true/false из ответа → 1/0 (у колонок нет логического типа)."""
+def _flag(value) -> bool | None:
+    """true/false из ответа → bool (тип boolean в SDK 2.5+)."""
     if value is None:
         return None
     if isinstance(value, str):
-        value = value.strip().lower() in ("1", "true", "yes", "on")
-    return 1 if value else 0
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 class MegafonConnector(Connector):
@@ -559,9 +645,16 @@ class MegafonConnector(Connector):
     name = "megafon-telephony"  # латиница/цифры/«-»/«_»; между версиями не менять
     label = "Телефония Мегафон"
     description = "Звонки, сотрудники и отделы виртуальной АТС Мегафон."
-    version = "0.3.0"
+    version = "0.4.0"
     publisher = "ITGRN"
     docs_url = ""
+
+    # --- Шаблоны из коробки (операции templates, quick_start) ------------- #
+
+    datasets = t.DATASETS
+    widgets = t.WIDGETS
+    dashboards = t.DASHBOARDS
+    quick_start = t.QUICK_START
 
     # --- Форма подключения источника: что вводит пользователь -------------- #
 
